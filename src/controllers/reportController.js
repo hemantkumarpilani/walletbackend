@@ -6,14 +6,10 @@ const mongoose = require("mongoose");
 const Report = require("../models/Report");
 const Wallet = require("../models/Wallet");
 const WalletTransaction = require("../models/WalletTransaction");
+const TransactionCategory = require("../models/TransactionCategory");
 const { successResponse, errorResponse } = require("../utils/responseHandler");
 const { assertCanCreateReport } = require("../utils/planLimits");
-const {
-  buildCsv,
-  buildPdfBuffer,
-  buildReceiptsCsv,
-} = require("../utils/reportExport");
-const { uploadReport } = require("../utils/r2Storage");
+const { buildReportJson } = require("../utils/reportExport");
 
 const STORAGE_DIR = path.join(__dirname, "..", "..", "storage", "reports");
 
@@ -46,6 +42,62 @@ const applyTransactionFilters = (txFilter, filters) => {
     }
     txFilter.categoryId = filters.categoryId;
   }
+};
+
+const enrichReportMeta = async (userId, { walletIds = [], filters = {} }) => {
+  const categoryId = filters?.categoryId;
+
+  const [wallets, category] = await Promise.all([
+    walletIds.length > 0
+      ? Wallet.find({
+          _id: { $in: walletIds },
+          userId,
+          isDeleted: false,
+        })
+          .select("walletName")
+          .lean()
+      : [],
+    categoryId && mongoose.isValidObjectId(categoryId)
+      ? TransactionCategory.findOne({
+          _id: categoryId,
+          userId,
+          isDeleted: false,
+        })
+          .select("name")
+          .lean()
+      : null,
+  ]);
+
+  const walletById = new Map(wallets.map((wallet) => [wallet._id.toString(), wallet]));
+
+  return {
+    wallets: walletIds.map((walletId) => ({
+      walletId: String(walletId),
+      walletName: walletById.get(String(walletId))?.walletName ?? null,
+    })),
+    category:
+      categoryId && mongoose.isValidObjectId(categoryId)
+        ? {
+            categoryId: String(categoryId),
+            categoryName: category?.name ?? null,
+          }
+        : null,
+  };
+};
+
+const formatReportResponse = async (userId, report) => {
+  const plain =
+    typeof report.toObject === "function" ? report.toObject() : { ...report };
+  const { wallets, category } = await enrichReportMeta(userId, {
+    walletIds: plain.walletIds,
+    filters: plain.filters,
+  });
+
+  return {
+    ...plain,
+    wallets,
+    category,
+  };
 };
 
 const createReport = async (req, res) => {
@@ -122,30 +174,10 @@ const createReport = async (req, res) => {
       .sort({ transactionDate: -1 })
       .lean();
 
-    let buffer;
-    let mimeType;
-    let extension;
-
-    if (type === "PDF") {
-      buffer = await buildPdfBuffer(rows, { fromDate: from, toDate: to });
-      mimeType = "application/pdf";
-      extension = "pdf";
-    } else if (type === "RECEIPTS_CSV") {
-      buffer = Buffer.from(buildReceiptsCsv(rows), "utf8");
-      mimeType = "text/csv";
-      extension = "csv";
-    } else {
-      buffer = Buffer.from(buildCsv(rows), "utf8");
-      mimeType = "text/csv";
-      extension = "csv";
-    }
-
-    const fileName = `report-${userId}-${Date.now()}.${extension}`;
-    const fileUrl = await uploadReport({
-      buffer,
-      mimeType,
-      fileName,
-      userId,
+    const reportData = buildReportJson(rows, {
+      reportType: type,
+      fromDate: from,
+      toDate: to,
     });
 
     const report = await Report.create({
@@ -155,10 +187,20 @@ const createReport = async (req, res) => {
       fromDate: from,
       toDate: to,
       filters,
-      fileUrl,
+      reportData,
     });
 
-    return successResponse(res, "Report generated successfully", report, 201);
+    const responseData = await formatReportResponse(userId, {
+      ...report.toObject(),
+      reportData,
+    });
+
+    return successResponse(
+      res,
+      "Report generated successfully",
+      responseData,
+      201,
+    );
   } catch (error) {
     const code = error.statusCode || 500;
     return errorResponse(res, error.message, code);
@@ -178,8 +220,12 @@ const listReports = async (req, res) => {
       Report.countDocuments(filter),
     ]);
 
+    const enrichedItems = await Promise.all(
+      items.map((item) => formatReportResponse(req.user.userId, item)),
+    );
+
     return successResponse(res, "Reports fetched successfully", {
-      items,
+      items: enrichedItems,
       pagination: {
         page,
         limit,
@@ -206,6 +252,21 @@ const downloadReport = async (req, res) => {
 
     if (!report) {
       return errorResponse(res, "Report not found", 404);
+    }
+
+    if (report.reportData) {
+      const responseData = await formatReportResponse(req.user.userId, report);
+      return successResponse(res, "Report fetched successfully", {
+        id: responseData._id,
+        reportType: responseData.reportType,
+        fromDate: responseData.fromDate,
+        toDate: responseData.toDate,
+        filters: responseData.filters,
+        wallets: responseData.wallets,
+        category: responseData.category,
+        generatedAt: responseData.generatedAt,
+        reportData: responseData.reportData,
+      });
     }
 
     if (report.fileUrl?.startsWith("http")) {

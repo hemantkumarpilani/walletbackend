@@ -6,23 +6,17 @@ const Wallet = require("../models/Wallet");
 const User = require("../models/User");
 const TransactionCategory = require("../models/TransactionCategory");
 const { successResponse, errorResponse } = require("../utils/responseHandler");
-const { assertSufficientWalletBalance } = require("../utils/walletBalance");
+const {
+  startOfDay,
+  endOfDay,
+  occurrenceKey,
+  generateOccurrences,
+  fetchPlannedPaymentOccurrences,
+} = require("../utils/plannedPaymentOccurrences");
 
 const REPEAT_UNITS = ["DAYS", "WEEKS", "MONTHS", "YEARS"];
 const OCCURRENCE_TYPES = ["ALL", "UPCOMING", "OVERDUE"];
 const DECISION_TYPES = ["ALL", "ACCEPTED", "DECLINED"];
-
-const startOfDay = (date) => {
-  const d = new Date(date);
-  d.setHours(0, 0, 0, 0);
-  return d;
-};
-
-const endOfDay = (date) => {
-  const d = new Date(date);
-  d.setHours(23, 59, 59, 999);
-  return d;
-};
 
 const parseDate = (value) => {
   if (!value) {
@@ -31,33 +25,6 @@ const parseDate = (value) => {
 
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
-};
-
-const padDatePart = (value) => String(value).padStart(2, "0");
-
-const occurrenceKey = (date) => {
-  const d = startOfDay(date);
-  return [
-    d.getFullYear(),
-    padDatePart(d.getMonth() + 1),
-    padDatePart(d.getDate()),
-  ].join("-");
-};
-
-const addRepeatInterval = (date, interval, unit) => {
-  const next = new Date(date);
-
-  if (unit === "DAYS") {
-    next.setDate(next.getDate() + interval);
-  } else if (unit === "WEEKS") {
-    next.setDate(next.getDate() + interval * 7);
-  } else if (unit === "MONTHS") {
-    next.setMonth(next.getMonth() + interval);
-  } else if (unit === "YEARS") {
-    next.setFullYear(next.getFullYear() + interval);
-  }
-
-  return next;
 };
 
 const normalizePlannedType = (value) => {
@@ -127,9 +94,13 @@ const buildPlannedPaymentPayload = async (req, res) => {
     return null;
   }
 
-  if (!categoryId || !mongoose.isValidObjectId(categoryId)) {
-    errorResponse(res, "Valid categoryId is required", 400);
-    return null;
+  let resolvedCategoryId = null;
+  if (categoryId !== undefined && categoryId !== null && categoryId !== "") {
+    if (!mongoose.isValidObjectId(categoryId)) {
+      errorResponse(res, "Valid categoryId is required", 400);
+      return null;
+    }
+    resolvedCategoryId = categoryId;
   }
 
   const normalizedType = normalizeTransactionType(type);
@@ -194,7 +165,9 @@ const buildPlannedPaymentPayload = async (req, res) => {
 
   const [wallet, category] = await Promise.all([
     assertOwnWallet(userId, resolvedWalletId),
-    assertCategoryForUser(userId, categoryId),
+    resolvedCategoryId
+      ? assertCategoryForUser(userId, resolvedCategoryId)
+      : Promise.resolve(null),
   ]);
 
   if (!wallet) {
@@ -202,7 +175,7 @@ const buildPlannedPaymentPayload = async (req, res) => {
     return null;
   }
 
-  if (!category) {
+  if (resolvedCategoryId && !category) {
     errorResponse(res, "Category not found", 404);
     return null;
   }
@@ -210,7 +183,7 @@ const buildPlannedPaymentPayload = async (req, res) => {
   return {
     userId,
     walletId: resolvedWalletId,
-    categoryId,
+    categoryId: resolvedCategoryId,
     type: normalizedType,
     title: title.trim(),
     amount: amt,
@@ -223,80 +196,6 @@ const buildPlannedPaymentPayload = async (req, res) => {
       normalizedPlannedType === "ONE_TIME" ? 1 : parsedRepeatUntilTimes,
   };
 };
-
-const generateOccurrences = (plannedPayment, today, rangeEnd, includeOverdue) => {
-  const decisions = new Map();
-  (plannedPayment.decisions || []).forEach((decision) => {
-    decisions.set(decision.occurrenceKey, decision);
-
-    if (decision.occurrenceDate) {
-      decisions.set(occurrenceKey(decision.occurrenceDate), decision);
-    }
-  });
-
-  const totalOccurrences =
-    plannedPayment.plannedType === "ONE_TIME"
-      ? 1
-      : plannedPayment.repeatUntilTimes;
-
-  const occurrences = [];
-  let current = startOfDay(plannedPayment.startDate);
-
-  for (let index = 1; index <= totalOccurrences; index += 1) {
-    const key = occurrenceKey(current);
-    const decision = decisions.get(key);
-
-    if (!decision) {
-      const occurrenceDate = startOfDay(current);
-      const isOverdue = occurrenceDate < today;
-      const isUpcoming = occurrenceDate >= today && occurrenceDate <= rangeEnd;
-
-      if ((includeOverdue && isOverdue) || isUpcoming) {
-        occurrences.push({
-          plannedPayment,
-          occurrence: {
-            occurrenceKey: key,
-            occurrenceNumber: index,
-            occurrenceDate,
-            status: isOverdue ? "OVERDUE" : "UPCOMING",
-          },
-        });
-      }
-    }
-
-    if (plannedPayment.plannedType === "ONE_TIME") {
-      break;
-    }
-
-    current = addRepeatInterval(
-      current,
-      plannedPayment.repeatInterval,
-      plannedPayment.repeatUnit,
-    );
-  }
-
-  return occurrences;
-};
-
-const formatOccurrence = ({ plannedPayment, occurrence }) => ({
-  _id: plannedPayment._id,
-  plannedPaymentId: plannedPayment._id,
-  occurrenceKey: occurrence.occurrenceKey,
-  occurrenceNumber: occurrence.occurrenceNumber,
-  occurrenceDate: occurrence.occurrenceDate,
-  status: occurrence.status,
-  type: plannedPayment.type,
-  title: plannedPayment.title,
-  amount: plannedPayment.amount,
-  description: plannedPayment.description,
-  plannedType: plannedPayment.plannedType,
-  startDate: plannedPayment.startDate,
-  repeatInterval: plannedPayment.repeatInterval,
-  repeatUnit: plannedPayment.repeatUnit,
-  repeatUntilTimes: plannedPayment.repeatUntilTimes,
-  walletId: plannedPayment.walletId,
-  categoryId: plannedPayment.categoryId,
-});
 
 const formatDecision = ({ plannedPayment, decision }) => ({
   _id: `${plannedPayment._id}:${decision.occurrenceKey}`,
@@ -319,6 +218,28 @@ const formatDecision = ({ plannedPayment, decision }) => ({
   transaction: decision.transactionId || null,
 });
 
+const hasScheduleChanged = (existing, payload) => {
+  if (existing.plannedType !== payload.plannedType) {
+    return true;
+  }
+
+  if (
+    startOfDay(existing.startDate).getTime() !== payload.startDate.getTime()
+  ) {
+    return true;
+  }
+
+  if (payload.plannedType === "REPEATED") {
+    return (
+      existing.repeatInterval !== payload.repeatInterval ||
+      existing.repeatUnit !== payload.repeatUnit ||
+      existing.repeatUntilTimes !== payload.repeatUntilTimes
+    );
+  }
+
+  return false;
+};
+
 const createPlannedPayment = async (req, res) => {
   try {
     const payload = await buildPlannedPaymentPayload(req, res);
@@ -337,11 +258,177 @@ const createPlannedPayment = async (req, res) => {
   }
 };
 
+const formatPlannedPaymentRule = (plannedPayment) => {
+  const doc = plannedPayment.toObject
+    ? plannedPayment.toObject()
+    : { ...plannedPayment };
+
+  return {
+    _id: doc._id,
+    userId: doc.userId,
+    walletId: doc.walletId,
+    categoryId: doc.categoryId,
+    type: doc.type,
+    title: doc.title,
+    amount: doc.amount,
+    description: doc.description,
+    plannedType: doc.plannedType,
+    startDate: doc.startDate,
+    repeatInterval: doc.repeatInterval,
+    repeatUnit: doc.repeatUnit,
+    repeatUntilTimes: doc.repeatUntilTimes,
+    status: doc.status,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+  };
+};
+
+const listPlannedPayments = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const daysParam = req.query.days;
+
+    const items = await PlannedPayment.find({
+      userId,
+      status: "ACTIVE",
+      isDeleted: false,
+    })
+      .sort({ createdAt: -1 })
+      .populate("walletId", "walletName")
+      .populate("categoryId", "name");
+
+    const response = {
+      items: items.map(formatPlannedPaymentRule),
+      count: items.length,
+    };
+
+    if (daysParam !== undefined) {
+      const days = Number(daysParam);
+
+      if (!Number.isInteger(days) || days < 0) {
+        return errorResponse(res, "days must be a non-negative integer", 400);
+      }
+
+      const upcoming = await fetchPlannedPaymentOccurrences(userId, {
+        days,
+        occurrenceType: "UPCOMING",
+      });
+
+      response.upcoming = upcoming.items;
+      response.upcomingCount = upcoming.count;
+    }
+
+    return successResponse(res, "Planned payments fetched successfully", response);
+  } catch (error) {
+    return errorResponse(res, error.message);
+  }
+};
+
+const updatePlannedPayment = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return errorResponse(res, "Invalid planned payment id", 400);
+    }
+
+    const existing = await PlannedPayment.findOne({
+      _id: id,
+      userId,
+      isDeleted: false,
+      status: "ACTIVE",
+    });
+
+    if (!existing) {
+      return errorResponse(res, "Planned payment not found", 404);
+    }
+
+    const payload = await buildPlannedPaymentPayload(req, res);
+    if (!payload) {
+      return null;
+    }
+
+    const updateData = {
+      walletId: payload.walletId,
+      categoryId: payload.categoryId,
+      type: payload.type,
+      title: payload.title,
+      amount: payload.amount,
+      description: payload.description,
+      plannedType: payload.plannedType,
+      startDate: payload.startDate,
+      repeatInterval: payload.repeatInterval,
+      repeatUnit: payload.repeatUnit,
+      repeatUntilTimes: payload.repeatUntilTimes,
+      updatedAt: new Date(),
+    };
+
+    if (hasScheduleChanged(existing, payload)) {
+      updateData.decisions = [];
+    }
+
+    const plannedPayment = await PlannedPayment.findOneAndUpdate(
+      {
+        _id: id,
+        userId,
+        isDeleted: false,
+        status: "ACTIVE",
+      },
+      { $set: updateData },
+      { new: true },
+    )
+      .populate("walletId", "walletName")
+      .populate("categoryId", "name");
+
+    return successResponse(res, "Planned payment updated successfully", plannedPayment);
+  } catch (error) {
+    return errorResponse(res, error.message);
+  }
+};
+
+const deletePlannedPayment = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.isValidObjectId(id)) {
+      return errorResponse(res, "Invalid planned payment id", 400);
+    }
+
+    const plannedPayment = await PlannedPayment.findOneAndUpdate(
+      {
+        _id: id,
+        userId: req.user.userId,
+        isDeleted: false,
+      },
+      {
+        $set: {
+          isDeleted: true,
+          status: "CANCELLED",
+          updatedAt: new Date(),
+        },
+      },
+      { new: true },
+    );
+
+    if (!plannedPayment) {
+      return errorResponse(res, "Planned payment not found", 404);
+    }
+
+    return successResponse(res, "Planned payment deleted successfully");
+  } catch (error) {
+    return errorResponse(res, error.message);
+  }
+};
+
 const listPlannedPaymentOccurrences = async (req, res) => {
   try {
     const userId = req.user.userId;
     const days = Number(req.query.days);
     const occurrenceType = String(req.query.type || "ALL").toUpperCase();
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const skip = (page - 1) * limit;
 
     if (!Number.isInteger(days) || days < 0) {
       return errorResponse(res, "days must be a non-negative integer", 400);
@@ -351,46 +438,30 @@ const listPlannedPaymentOccurrences = async (req, res) => {
       return errorResponse(res, "type must be ALL, UPCOMING or OVERDUE", 400);
     }
 
-    const today = startOfDay(new Date());
-    const rangeEnd = endOfDay(today);
-    rangeEnd.setDate(rangeEnd.getDate() + days);
+    const result = await fetchPlannedPaymentOccurrences(userId, {
+      days,
+      occurrenceType,
+    });
 
-    const plannedPayments = await PlannedPayment.find({
-      userId,
-      status: "ACTIVE",
-      isDeleted: false,
-      startDate: { $lte: rangeEnd },
-    })
-      .populate("walletId", "walletName")
-      .populate("categoryId", "name")
-      .lean();
-
-    const includeOverdue =
-      occurrenceType === "ALL" || occurrenceType === "OVERDUE";
-
-    let items = plannedPayments.flatMap((plannedPayment) =>
-      generateOccurrences(plannedPayment, today, rangeEnd, includeOverdue),
-    );
-
-    if (occurrenceType !== "ALL") {
-      items = items.filter(
-        (item) => item.occurrence.status === occurrenceType,
-      );
-    }
-
-    items.sort(
-      (a, b) =>
-        a.occurrence.occurrenceDate.getTime() -
-        b.occurrence.occurrenceDate.getTime(),
-    );
+    const total = result.count;
 
     return successResponse(res, "Planned payments fetched successfully", {
-      items: items.map(formatOccurrence),
-      count: items.length,
+      items: result.items.slice(skip, skip + limit),
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit) || 1,
+      },
     });
   } catch (error) {
     return errorResponse(res, error.message);
   }
+};
+
+const listUpcomingPlannedPayments = async (req, res) => {
+  req.query.type = "UPCOMING";
+  return listPlannedPaymentOccurrences(req, res);
 };
 
 const listPlannedPaymentDecisions = async (req, res) => {
@@ -455,19 +526,18 @@ const listPlannedPaymentDecisions = async (req, res) => {
   }
 };
 
-const decidePlannedPaymentOccurrence = async (req, res) => {
+const applyOccurrenceDecision = async ({
+  userId,
+  plannedPaymentId,
+  occurrenceDate,
+  action,
+  res,
+  successMessage = "Planned payment occurrence updated successfully",
+}) => {
   const session = await mongoose.startSession();
+  const normalizedAction = String(action || "").trim().toUpperCase();
 
   try {
-    const userId = req.user.userId;
-    const { id } = req.params;
-    const { occurrenceDate, action } = req.body;
-    const normalizedAction = String(action || "").trim().toUpperCase();
-
-    if (!mongoose.isValidObjectId(id)) {
-      return errorResponse(res, "Invalid planned payment id", 400);
-    }
-
     if (!["ACCEPT", "DECLINE"].includes(normalizedAction)) {
       return errorResponse(res, "action must be ACCEPT or DECLINE", 400);
     }
@@ -483,7 +553,7 @@ const decidePlannedPaymentOccurrence = async (req, res) => {
     session.startTransaction();
 
     const plannedPayment = await PlannedPayment.findOne({
-      _id: id,
+      _id: plannedPaymentId,
       userId,
       status: "ACTIVE",
       isDeleted: false,
@@ -521,31 +591,28 @@ const decidePlannedPaymentOccurrence = async (req, res) => {
     let transaction = null;
 
     if (normalizedAction === "ACCEPT") {
-      const [wallet, category] = await Promise.all([
-        assertOwnWallet(userId, plannedPayment.walletId, session),
-        assertCategoryForUser(userId, plannedPayment.categoryId, session),
-      ]);
+      const wallet = await assertOwnWallet(
+        userId,
+        plannedPayment.walletId,
+        session,
+      );
 
       if (!wallet) {
         await session.abortTransaction();
         return errorResponse(res, "Wallet not found", 404);
       }
 
-      if (!category) {
-        await session.abortTransaction();
-        return errorResponse(res, "Category not found", 404);
-      }
+      let category = null;
+      if (plannedPayment.categoryId) {
+        category = await assertCategoryForUser(
+          userId,
+          plannedPayment.categoryId,
+          session,
+        );
 
-      if (plannedPayment.type === "EXPENSE") {
-        try {
-          await assertSufficientWalletBalance(
-            userId,
-            plannedPayment.walletId,
-            plannedPayment.amount,
-          );
-        } catch (error) {
+        if (!category) {
           await session.abortTransaction();
-          return errorResponse(res, error.message, error.statusCode || 400);
+          return errorResponse(res, "Category not found", 404);
         }
       }
 
@@ -554,17 +621,19 @@ const decidePlannedPaymentOccurrence = async (req, res) => {
           {
             userId,
             walletId: plannedPayment.walletId,
-            categoryId: plannedPayment.categoryId,
+            categoryId: plannedPayment.categoryId ?? null,
             type: plannedPayment.type,
             amount: plannedPayment.amount,
             title: plannedPayment.title,
             description: plannedPayment.description,
             transactionDate: normalizedOccurrenceDate,
-            categorySnapshot: {
-              name: category.name,
-              color: category.color,
-              icon: category.icon,
-            },
+            categorySnapshot: category
+              ? {
+                  name: category.name,
+                  color: category.color,
+                  icon: category.icon,
+                }
+              : null,
             walletSnapshot: {
               walletName: wallet.walletName,
               walletColor: wallet.color,
@@ -622,7 +691,7 @@ const decidePlannedPaymentOccurrence = async (req, res) => {
           .populate("categoryId", "name")
       : null;
 
-    return successResponse(res, "Planned payment occurrence updated successfully", {
+    return successResponse(res, successMessage, {
       plannedPaymentId: plannedPayment._id,
       occurrenceKey: key,
       status: decisionStatus,
@@ -638,8 +707,48 @@ const decidePlannedPaymentOccurrence = async (req, res) => {
   }
 };
 
+const decidePlannedPaymentOccurrence = async (req, res) => {
+  const { id } = req.params;
+  const { occurrenceDate, action } = req.body;
+
+  if (!mongoose.isValidObjectId(id)) {
+    return errorResponse(res, "Invalid planned payment id", 400);
+  }
+
+  return applyOccurrenceDecision({
+    userId: req.user.userId,
+    plannedPaymentId: id,
+    occurrenceDate,
+    action,
+    res,
+  });
+};
+
+const deletePlannedPaymentOccurrence = async (req, res) => {
+  const { id } = req.params;
+  const { occurrenceDate } = req.body;
+
+  if (!mongoose.isValidObjectId(id)) {
+    return errorResponse(res, "Invalid planned payment id", 400);
+  }
+
+  return applyOccurrenceDecision({
+    userId: req.user.userId,
+    plannedPaymentId: id,
+    occurrenceDate,
+    action: "DECLINE",
+    res,
+    successMessage: "Planned payment occurrence deleted successfully",
+  });
+};
+
 module.exports = {
+  listPlannedPayments,
+  listUpcomingPlannedPayments,
   createPlannedPayment,
+  updatePlannedPayment,
+  deletePlannedPayment,
+  deletePlannedPaymentOccurrence,
   listPlannedPaymentOccurrences,
   listPlannedPaymentDecisions,
   decidePlannedPaymentOccurrence,

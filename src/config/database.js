@@ -1,10 +1,20 @@
 const mongoose = require("mongoose");
-
-const MONGODB_URI = `mongodb+srv://${process.env.MONGODB_USER}:${process.env.MONGODB_PASSWORD}@cluster0.9mzdwiq.mongodb.net/${process.env.DB_NAME}?appName=Cluster0`;
+const { ensureCurrenciesSeeded } = require("../config/currencySeed");
+const { ensureDefaultAdminSeeded } = require("../config/adminSeed");
+const { ensureOnboardingTemplatesSeeded } = require("../config/onboardingSeed");
+const { ensureLegalDocumentsSeeded } = require("../config/legalSeed");
+const User = require("../models/User");
+const { refreshExchangeRates } = require("../services/exchangeRateService");
 
 const connectDB = async () => {
+  const mongoUrl = process.env.MONGO_URL;
+  if (!mongoUrl) {
+    console.error("MONGO_URL is not set in environment variables");
+    process.exit(1);
+  }
+
   try {
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(mongoUrl);
 
     // Ensure TTL index exists so expired OTPs are auto-removed by MongoDB.
     const otpCollection = mongoose.connection.db.collection("otps");
@@ -22,6 +32,20 @@ const connectDB = async () => {
     }
 
     console.log("✅ MongoDB Connected");
+
+    await ensureCurrenciesSeeded();
+    await ensureDefaultAdminSeeded();
+    await ensureOnboardingTemplatesSeeded();
+    await ensureLegalDocumentsSeeded();
+    await User.updateMany(
+      { status: "BLOCKED" },
+      { $set: { status: "DEACTIVATED" } },
+    );
+    try {
+      await refreshExchangeRates({ force: false });
+    } catch (error) {
+      console.error("Initial exchange rate refresh failed:", error.message);
+    }
   } catch (error) {
     console.log(error);
     process.exit(1);

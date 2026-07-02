@@ -2,14 +2,27 @@ const mongoose = require("mongoose");
 
 const WalletTransaction = require("../models/WalletTransaction");
 const Wallet = require("../models/Wallet");
+const WalletTransfer = require("../models/WalletTransfer");
 const TransactionCategory = require("../models/TransactionCategory");
-const Attachment = require("../models/Attachment");
 const { successResponse, errorResponse } = require("../utils/responseHandler");
-const { uploadReceipt } = require("../utils/r2Storage");
+const {
+  assertCanUploadReceipt,
+  getReplacingReceiptBytes,
+  deleteReceiptAttachmentsForTransactions,
+  createReceiptAttachment,
+} = require("../utils/receiptUpload");
 const {
   aggregateBalancesByWalletIds,
-  assertSufficientWalletBalance,
+  formatWalletBalancePayload,
 } = require("../utils/walletBalance");
+const { resolveTransactionAmount } = require("../utils/currencyConversion");
+const {
+  parseBooleanFlag,
+  findTransferForTransaction,
+  getTransferLegRole,
+  convertCounterpartAmount,
+  loadTransferLegs,
+} = require("../utils/transferTransactionSync");
 
 const parseDate = (value, endOfDay = false) => {
   if (!value) {
@@ -25,6 +38,33 @@ const parseDate = (value, endOfDay = false) => {
   return d;
 };
 
+const normalizeTransactionReferences = (transaction) => {
+  const normalized = { ...transaction };
+
+  if (!normalized.walletId) {
+    normalized.walletId = {
+      _id: null,
+      walletName: normalized.walletSnapshot?.walletName || "Unknown wallet",
+      currency: null,
+    };
+  }
+
+  const hasUnknownCategory =
+    normalized.categorySnapshot?.name === "Unknown category";
+
+  if (!normalized.categoryId && hasUnknownCategory) {
+    normalized.categoryId = {
+      _id: null,
+      name: "Unknown category",
+      color: normalized.categorySnapshot?.color ?? null,
+      icon: normalized.categorySnapshot?.icon ?? null,
+      isDefault: false,
+    };
+  }
+
+  return normalized;
+};
+
 const assertOwnWallet = (userId, walletId) =>
   Wallet.findOne({ _id: walletId, userId, isDeleted: false });
 
@@ -34,40 +74,6 @@ const assertCategoryForUser = async (userId, categoryId) =>
     userId,
     isDeleted: false,
   });
-
-const createReceiptAttachment = async ({ userId, transactionId, file }) => {
-  if (!file) {
-    return null;
-  }
-
-  const uploaded = await uploadReceipt({
-    buffer: file.buffer,
-    mimeType: file.mimetype,
-    originalName: file.originalname,
-    userId,
-  });
-
-  const attachment = await Attachment.create({
-    userId,
-    transactionId,
-    fileUrl: uploaded.url,
-    storageKey: uploaded.key,
-    originalName: file.originalname,
-    fileType: file.mimetype,
-    fileSize: file.size,
-    purpose: "RECEIPT",
-  });
-
-  return {
-    attachmentId: attachment._id,
-    fileUrl: attachment.fileUrl,
-    storageKey: attachment.storageKey,
-    originalName: attachment.originalName,
-    fileType: attachment.fileType,
-    fileSize: attachment.fileSize,
-    uploadedAt: attachment.uploadedAt,
-  };
-};
 
 const listTransactions = async (req, res) => {
   try {
@@ -119,14 +125,14 @@ const listTransactions = async (req, res) => {
         .sort({ transactionDate: -1, createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .populate("walletId", "walletName")
+        .populate("walletId", "walletName currency")
         .populate("categoryId", "name isDefault")
         .lean(),
       WalletTransaction.countDocuments(filter),
     ]);
 
     return successResponse(res, "Transactions fetched successfully", {
-      items,
+      items: items.map(normalizeTransactionReferences),
       pagination: {
         page,
         limit,
@@ -151,14 +157,18 @@ const getTransaction = async (req, res) => {
       userId: req.user.userId,
       isDeleted: false,
     })
-      .populate("walletId", "walletName")
+      .populate("walletId", "walletName currency")
       .populate("categoryId", "name");
 
     if (!tx) {
       return errorResponse(res, "Transaction not found", 404);
     }
 
-    return successResponse(res, "Transaction fetched successfully", tx);
+    return successResponse(
+      res,
+      "Transaction fetched successfully",
+      normalizeTransactionReferences(tx.toObject()),
+    );
   } catch (error) {
     return errorResponse(res, error.message);
   }
@@ -175,6 +185,8 @@ const createTransaction = async (req, res) => {
       title,
       description,
       transactionDate,
+      amountCurrency,
+      amountIn,
     } = req.body;
 
     if (!walletId || !mongoose.isValidObjectId(walletId)) {
@@ -189,10 +201,6 @@ const createTransaction = async (req, res) => {
     if (amount === undefined || Number(amount) <= 0 || Number.isNaN(Number(amount))) {
       return errorResponse(res, "amount must be a positive number", 400);
     }
-    if (!title || typeof title !== "string" || !title.trim()) {
-      return errorResponse(res, "title is required", 400);
-    }
-
     const wallet = await assertOwnWallet(userId, walletId);
     if (!wallet) {
       return errorResponse(res, "Wallet not found", 404);
@@ -210,13 +218,25 @@ const createTransaction = async (req, res) => {
       return errorResponse(res, "Invalid transactionDate", 400);
     }
 
-    const amt = Number(amount);
+    let transactionAmounts;
+    try {
+      transactionAmounts = await resolveTransactionAmount({
+        amount,
+        wallet,
+        amountCurrency,
+        amountIn,
+      });
+    } catch (error) {
+      return errorResponse(res, error.message, error.statusCode || 400);
+    }
 
-    if (type === "EXPENSE") {
+    const amt = transactionAmounts.amount;
+
+    if (req.file) {
       try {
-        await assertSufficientWalletBalance(userId, walletId, amt);
+        await assertCanUploadReceipt(userId, req.file.size);
       } catch (error) {
-        return errorResponse(res, error.message, error.statusCode || 400);
+        return errorResponse(res, error.message, error.statusCode || 403);
       }
     }
 
@@ -226,13 +246,21 @@ const createTransaction = async (req, res) => {
       categoryId: category?._id ?? null,
       type,
       amount: amt,
-      title: title.trim(),
+      inputAmount: transactionAmounts.inputAmount,
+      inputCurrency: transactionAmounts.inputCurrency,
+      walletCurrency: transactionAmounts.walletCurrency,
+      exchangeRate: transactionAmounts.exchangeRate,
+      rateUpdatedAt: transactionAmounts.rateUpdatedAt,
+      title: typeof title === "string" && title.trim() ? title.trim() : null,
       description: description ?? null,
       transactionDate: txDate,
       categorySnapshot: category
         ? { name: category.name, color: category.color, icon: category.icon }
         : null,
-      walletSnapshot: { walletName: wallet.walletName },
+      walletSnapshot: {
+        walletName: wallet.walletName,
+        walletColor: wallet.color,
+      },
       createdBy: userId,
     });
 
@@ -240,6 +268,7 @@ const createTransaction = async (req, res) => {
       userId,
       transactionId: doc._id,
       file: req.file,
+      replaceTransactionIds: [],
     });
 
     if (receipt) {
@@ -248,7 +277,7 @@ const createTransaction = async (req, res) => {
     }
 
     const populated = await WalletTransaction.findById(doc._id)
-      .populate("walletId", "walletName")
+      .populate("walletId", "walletName currency")
       .populate("categoryId", "name");
 
     return successResponse(res, "Transaction created successfully", populated, 201);
@@ -295,15 +324,6 @@ const assertWalletBalancesAfterTransactionUpdate = async (
       getTransactionWalletEffect(nextTransaction),
   );
 
-  const hasNegativeBalance = [...projectedBalances.values()].some(
-    (balance) => balance < 0,
-  );
-
-  if (hasNegativeBalance) {
-    const err = new Error("Your wallet balance is less than the payment amount.");
-    err.statusCode = 400;
-    throw err;
-  }
 };
 
 const updateTransaction = async (req, res) => {
@@ -319,6 +339,9 @@ const updateTransaction = async (req, res) => {
       description,
       transactionDate,
       removeReceipt,
+      amountCurrency,
+      amountIn,
+      updateReferenceTransaction,
     } = req.body;
 
     if (!mongoose.isValidObjectId(id)) {
@@ -335,11 +358,28 @@ const updateTransaction = async (req, res) => {
       return errorResponse(res, "Transaction not found", 404);
     }
 
+    if (req.file) {
+      try {
+        const replacingBytes = await getReplacingReceiptBytes({
+          userId,
+          transactionIds: [transaction._id],
+        });
+        await assertCanUploadReceipt(userId, req.file.size, { replacingBytes });
+      } catch (error) {
+        return errorResponse(res, error.message, error.statusCode || 403);
+      }
+    }
+
     if (walletId !== undefined && !mongoose.isValidObjectId(walletId)) {
       return errorResponse(res, "Valid walletId is required", 400);
     }
 
-    if (categoryId !== undefined && !mongoose.isValidObjectId(categoryId)) {
+    if (
+      categoryId !== undefined &&
+      categoryId !== null &&
+      categoryId !== "" &&
+      !mongoose.isValidObjectId(categoryId)
+    ) {
       return errorResponse(res, "Valid categoryId is required", 400);
     }
 
@@ -355,10 +395,6 @@ const updateTransaction = async (req, res) => {
       }
     }
 
-    if (title !== undefined && (typeof title !== "string" || !title.trim())) {
-      return errorResponse(res, "title must be a non-empty string", 400);
-    }
-
     let parsedTransactionDate;
     if (transactionDate !== undefined) {
       parsedTransactionDate = new Date(transactionDate);
@@ -368,9 +404,32 @@ const updateTransaction = async (req, res) => {
     }
 
     const nextWalletId = walletId ?? transaction.walletId;
-    const nextCategoryId = categoryId ?? transaction.categoryId;
+    let nextCategoryId;
+    if (categoryId === undefined) {
+      nextCategoryId = transaction.categoryId;
+    } else if (categoryId === null || categoryId === "") {
+      nextCategoryId = null;
+    } else {
+      nextCategoryId = categoryId;
+    }
     const nextType = type ?? transaction.type;
-    const nextAmount = parsedAmount ?? transaction.amount;
+    const nextAmountIn =
+      amountIn !== undefined
+        ? amountIn
+        : transaction.inputCurrency
+          ? "to"
+          : "from";
+    const nextAmountCurrency =
+      nextAmountIn === "from"
+        ? amountCurrency
+        : amountCurrency !== undefined
+          ? amountCurrency
+          : transaction.inputCurrency ?? undefined;
+    const nextInputAmount =
+      parsedAmount ??
+      (nextAmountIn === "to"
+        ? transaction.inputAmount ?? transaction.amount
+        : transaction.amount);
 
     const [wallet, category] = await Promise.all([
       assertOwnWallet(userId, nextWalletId),
@@ -384,6 +443,37 @@ const updateTransaction = async (req, res) => {
     if (nextCategoryId && !category) {
       return errorResponse(res, "Category not found", 404);
     }
+
+    let transactionAmounts;
+    const shouldRecalculateAmount =
+      parsedAmount !== undefined ||
+      walletId !== undefined ||
+      amountCurrency !== undefined ||
+      amountIn !== undefined;
+
+    if (shouldRecalculateAmount) {
+      try {
+        transactionAmounts = await resolveTransactionAmount({
+          amount: nextInputAmount,
+          wallet,
+          amountCurrency: nextAmountCurrency,
+          amountIn: nextAmountIn,
+        });
+      } catch (error) {
+        return errorResponse(res, error.message, error.statusCode || 400);
+      }
+    } else {
+      transactionAmounts = {
+        amount: transaction.amount,
+        inputAmount: transaction.inputAmount ?? null,
+        inputCurrency: transaction.inputCurrency ?? null,
+        walletCurrency: transaction.walletCurrency ?? wallet.currency,
+        exchangeRate: transaction.exchangeRate ?? null,
+        rateUpdatedAt: transaction.rateUpdatedAt ?? null,
+      };
+    }
+
+    const nextAmount = transactionAmounts.amount;
 
     try {
       await assertWalletBalancesAfterTransactionUpdate(userId, transaction, {
@@ -399,9 +489,15 @@ const updateTransaction = async (req, res) => {
     transaction.categoryId = nextCategoryId;
     transaction.type = nextType;
     transaction.amount = nextAmount;
+    transaction.inputAmount = transactionAmounts.inputAmount;
+    transaction.inputCurrency = transactionAmounts.inputCurrency;
+    transaction.walletCurrency = transactionAmounts.walletCurrency;
+    transaction.exchangeRate = transactionAmounts.exchangeRate;
+    transaction.rateUpdatedAt = transactionAmounts.rateUpdatedAt;
 
     if (title !== undefined) {
-      transaction.title = title.trim();
+      transaction.title =
+        typeof title === "string" && title.trim() ? title.trim() : null;
     }
 
     if (description !== undefined) {
@@ -414,37 +510,105 @@ const updateTransaction = async (req, res) => {
 
     if (removeReceipt === true || removeReceipt === "true") {
       transaction.set("receipt", undefined);
-      await Attachment.updateMany(
-        { transactionId: transaction._id, userId, purpose: "RECEIPT" },
-        { $set: { transactionId: null } },
-      );
+      await deleteReceiptAttachmentsForTransactions({
+        userId,
+        transactionIds: [transaction._id],
+      });
     }
 
     const receipt = await createReceiptAttachment({
       userId,
       transactionId: transaction._id,
       file: req.file,
+      replaceTransactionIds: req.file ? [transaction._id] : [],
     });
 
     if (receipt) {
       transaction.receipt = receipt;
     }
 
-    transaction.categorySnapshot = {
-      name: category?.name,
-      color: category?.color,
-      icon: category?.icon,
-    };
+    transaction.categorySnapshot = category
+      ? {
+          name: category.name,
+          color: category.color,
+          icon: category.icon,
+        }
+      : null;
     transaction.walletSnapshot = {
       walletName: wallet.walletName,
       walletColor: wallet.color,
     };
     transaction.updatedAt = new Date();
 
+    const shouldUpdateReference = parseBooleanFlag(updateReferenceTransaction);
+
+    if (shouldUpdateReference) {
+      const transfer = await findTransferForTransaction(userId, transaction._id);
+
+      if (transfer) {
+        const role = getTransferLegRole(transfer, transaction._id);
+
+        if (role) {
+          const { debitTx, creditTx } = await loadTransferLegs(userId, transfer);
+          const counterpart = role === "debit" ? creditTx : debitTx;
+          const nextCounterpartAmount = convertCounterpartAmount(
+            transfer,
+            role,
+            nextAmount,
+          );
+          const nextTitle =
+            title !== undefined
+              ? typeof title === "string" && title.trim()
+                ? title.trim()
+                : null
+              : transaction.title;
+          const nextDescription =
+            description !== undefined
+              ? description ?? null
+              : transaction.description;
+          const nextDate = parsedTransactionDate ?? transaction.transactionDate;
+
+          counterpart.amount = nextCounterpartAmount;
+          counterpart.title = nextTitle;
+          counterpart.description = nextDescription;
+          counterpart.transactionDate = nextDate;
+          counterpart.updatedAt = new Date();
+
+          if (role === "debit") {
+            transfer.fromAmount = nextAmount;
+            transfer.toAmount = nextCounterpartAmount;
+            transfer.amount = nextAmount;
+          } else {
+            transfer.fromAmount = nextCounterpartAmount;
+            transfer.toAmount = nextAmount;
+            transfer.amount = nextCounterpartAmount;
+          }
+
+          transfer.title = nextTitle || transfer.title || "Wallet transfer";
+          transfer.description = nextDescription;
+          transfer.transferDate = nextDate;
+          transfer.updatedAt = new Date();
+
+          const counterpartWallet = await Wallet.findById(counterpart.walletId).select(
+            "walletName color",
+          );
+
+          if (counterpartWallet) {
+            counterpart.walletSnapshot = {
+              walletName: counterpartWallet.walletName,
+              walletColor: counterpartWallet.color,
+            };
+          }
+
+          await Promise.all([counterpart.save(), transfer.save()]);
+        }
+      }
+    }
+
     await transaction.save();
 
     const populated = await WalletTransaction.findById(transaction._id)
-      .populate("walletId", "walletName")
+      .populate("walletId", "walletName currency")
       .populate("categoryId", "name");
 
     return successResponse(res, "Transaction updated successfully", populated);
@@ -454,29 +618,114 @@ const updateTransaction = async (req, res) => {
 };
 
 const deleteTransaction = async (req, res) => {
+  const session = await mongoose.startSession();
+
   try {
+    const userId = req.user.userId;
     const { id } = req.params;
+    const deleteReferenceTransaction =
+      req.body?.deleteReferenceTransaction ?? req.query?.deleteReferenceTransaction;
+
     if (!mongoose.isValidObjectId(id)) {
       return errorResponse(res, "Invalid id", 400);
     }
 
-    const tx = await WalletTransaction.findOneAndUpdate(
-      {
-        _id: id,
-        userId: req.user.userId,
-        isDeleted: false,
-      },
-      { $set: { isDeleted: true, updatedAt: new Date() } },
-      { new: true },
-    );
+    session.startTransaction();
+
+    const tx = await WalletTransaction.findOne({
+      _id: id,
+      userId,
+    }).session(session);
 
     if (!tx) {
+      await session.abortTransaction();
       return errorResponse(res, "Transaction not found", 404);
     }
 
-    return successResponse(res, "Transaction deleted successfully");
+    if (tx.isDeleted) {
+      const affectedWallets = await formatWalletBalancePayload(userId, [tx.walletId]);
+      await session.commitTransaction();
+      return successResponse(res, "Transaction deleted successfully", {
+        affectedWallets,
+      });
+    }
+
+    const shouldDeleteReference = parseBooleanFlag(deleteReferenceTransaction);
+    const now = new Date();
+    const idsToDelete = [tx._id];
+    let transferToRemove = null;
+
+    if (shouldDeleteReference) {
+      transferToRemove = await findTransferForTransaction(userId, tx._id, session);
+
+      if (transferToRemove) {
+        const role = getTransferLegRole(transferToRemove, tx._id);
+
+        if (role) {
+          const counterpartId =
+            role === "debit"
+              ? transferToRemove.creditTransactionId
+              : transferToRemove.debitTransactionId;
+
+          if (counterpartId) {
+            idsToDelete.push(counterpartId);
+          }
+        }
+      }
+    }
+
+    const transactionsToDelete = await WalletTransaction.find({
+      _id: { $in: idsToDelete },
+      userId,
+      isDeleted: false,
+    })
+      .select("walletId")
+      .session(session);
+
+    const affectedWalletIds = transactionsToDelete
+      .map((item) => item.walletId)
+      .filter(Boolean);
+
+    await deleteReceiptAttachmentsForTransactions({
+      userId,
+      transactionIds: idsToDelete,
+      session,
+    });
+
+    await WalletTransaction.updateMany(
+      {
+        _id: { $in: idsToDelete },
+        userId,
+        isDeleted: false,
+      },
+      { $set: { isDeleted: true, updatedAt: now } },
+      { session },
+    );
+
+    if (transferToRemove) {
+      await WalletTransfer.deleteOne(
+        { _id: transferToRemove._id, userId },
+        { session },
+      );
+    }
+
+    await session.commitTransaction();
+
+    const affectedWallets = await formatWalletBalancePayload(
+      userId,
+      affectedWalletIds,
+    );
+
+    return successResponse(res, "Transaction deleted successfully", {
+      affectedWallets,
+    });
   } catch (error) {
-    return errorResponse(res, error.message);
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
+    return errorResponse(res, error.message, error.statusCode || 500);
+  } finally {
+    session.endSession();
   }
 };
 

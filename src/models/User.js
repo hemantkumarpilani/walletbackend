@@ -86,11 +86,39 @@ const userSchema = new mongoose.Schema(
       ref: "Wallet",
       default: null,
     },
+    walletOrder: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Wallet",
+      },
+    ],
 
     subscriptionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Subscription",
       default: null,
+    },
+
+    stripeCustomerId: {
+      type: String,
+      default: null,
+      index: true,
+    },
+
+    receiptRetentionStartedAt: {
+      type: Date,
+      default: null,
+    },
+
+    receiptDeletionScheduledAt: {
+      type: Date,
+      default: null,
+    },
+
+    receiptStorageUsedBytes: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
 
     lastLoginAt: {
@@ -100,7 +128,7 @@ const userSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ["ACTIVE", "BLOCKED", "DELETED"],
+      enum: ["ACTIVE", "DEACTIVATED", "DELETED"],
       default: "ACTIVE",
       index: true,
     },

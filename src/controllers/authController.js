@@ -14,203 +14,24 @@ const {
 } = require("../utils/generateTokens");
 
 const { successResponse, errorResponse } = require("../utils/responseHandler");
-const { seedPlansIfEmpty, assignBasicPlanToUser } = require("../utils/planLimits");
+const {
+  seedPlansIfEmpty,
+  assignBasicPlanToUser,
+} = require("../utils/planLimits");
 const sendEmail = require("../utils/sendEmail");
 const { verifyProviderIdToken } = require("../utils/socialAuth");
+const { assertActiveCurrency } = require("../services/exchangeRateService");
+const { buildUserProfilePayload } = require("../utils/userProfile");
 const Wallet = require("../models/Wallet");
+const WalletTransaction = require("../models/WalletTransaction");
 const TransactionCategory = require("../models/TransactionCategory");
+const {
+  formatWalletOption,
+  groupCategoriesByType,
+} = require("../services/onboardingTemplateService");
 
-const DEFAULT_ONBOARDING_WALLETS = [
-  {
-    slug: "uber",
-    walletName: "Uber Wallet",
-    description: "",
-    icon: "CustomIcons.uber",
-    color: "0xff000000",
-    currency: "USD",
-    sortOrder: 1,
-    aliases: ["Uber Wallet"],
-  },
-  {
-    slug: "rydo",
-    walletName: "Rydo Wallet",
-    description: "",
-    icon: "CustomIcons.rydo",
-    color: "0xffff9518",
-    currency: "USD",
-    sortOrder: 2,
-    aliases: ["Rydo Wallet"],
-  },
-  {
-    slug: "ubereats",
-    walletName: "Uber Eats Wallet",
-    description: "",
-    icon: "CustomIcons.ubereats",
-    color: "0xff06c167",
-    currency: "USD",
-    sortOrder: 3,
-    aliases: ["Uber Eats Wallet"],
-  },
-  {
-    slug: "doordash",
-    walletName: "DoorDash Wallet",
-    description: "",
-    icon: "CustomIcons.doordash",
-    color: "0xfff72e08",
-    currency: "USD",
-    sortOrder: 4,
-    aliases: ["DoorDash Wallet", "Door Dash Wallet"],
-  },
-];
-
-const DEFAULT_ONBOARDING_CATEGORIES = [
-  {
-    slug: "fuel",
-    name: "Fuel",
-    description: "",
-    icon: "CustomIcons.catFuel",
-    color: "0xff4549ff",
-    sortOrder: 1,
-    aliases: ["Fuel"],
-  },
-  {
-    slug: "service",
-    name: "Service",
-    description: "",
-    icon: "CustomIcons.catService",
-    color: "0xfff77b00",
-    sortOrder: 2,
-    aliases: ["Service"],
-  },
-  {
-    slug: "maintenance",
-    name: "Maintenance",
-    description: "",
-    icon: "CustomIcons.catMaintenance",
-    color: "0xfff72e08",
-    sortOrder: 3,
-    aliases: ["Maintenance"],
-  },
-  {
-    slug: "repair",
-    name: "Repair",
-    description: "",
-    icon: "CustomIcons.catRepair",
-    color: "0xff48FFC3",
-    sortOrder: 4,
-    aliases: ["Repair"],
-  },
-  {
-    slug: "salary",
-    name: "Salary (Cash out)",
-    description: "",
-    icon: "CustomIcons.catPayout",
-    color: "0xff5cb109",
-    sortOrder: 5,
-    aliases: ["Salary (Cash out)", "Salary"],
-  },
-  {
-    slug: "loan",
-    name: "Loan",
-    description: "",
-    icon: "CustomIcons.catLoan",
-    color: "0xffFFA800",
-    sortOrder: 6,
-    aliases: ["Loan"],
-  },
-  {
-    slug: "borrowed",
-    name: "Borrowed",
-    description: "",
-    icon: "CustomIcons.catBorrow",
-    color: "0xff0095FF",
-    sortOrder: 7,
-    aliases: ["Borrowed"],
-  },
-];
-
-const stripAliases = ({ aliases, ...item }) => item;
-
-const seedOnboardingTemplatesIfMissing = async () => {
-  await Promise.all(
-    DEFAULT_ONBOARDING_WALLETS.map(async (wallet) => {
-      const existingWallet = await Wallet.findOne({
-        isDefault: true,
-        isDeleted: false,
-        $or: [
-          { slug: wallet.slug },
-          { walletName: { $in: wallet.aliases } },
-        ],
-      });
-
-      const walletData = {
-        ...stripAliases(wallet),
-        userId: null,
-        isDefault: true,
-      };
-
-      if (existingWallet) {
-        await Wallet.updateOne(
-          { _id: existingWallet._id },
-          { $set: { ...walletData, updatedAt: new Date() } },
-        );
-        return;
-      }
-
-      await Wallet.create(walletData);
-    }),
-  );
-
-  await Promise.all(
-    DEFAULT_ONBOARDING_CATEGORIES.map(async (category) => {
-      const existingCategory = await TransactionCategory.findOne({
-        isDefault: true,
-        isDeleted: false,
-        $or: [
-          { slug: category.slug },
-          { name: { $in: category.aliases } },
-        ],
-      });
-
-      const categoryData = {
-        ...stripAliases(category),
-        userId: null,
-        isDefault: true,
-      };
-
-      if (existingCategory) {
-        await TransactionCategory.updateOne(
-          { _id: existingCategory._id },
-          { $set: { ...categoryData, updatedAt: new Date() } },
-        );
-        return;
-      }
-
-      await TransactionCategory.create(categoryData);
-    }),
-  );
-
-  await Promise.all([
-    Wallet.updateMany(
-      {
-        isDefault: true,
-        userId: null,
-        slug: { $nin: DEFAULT_ONBOARDING_WALLETS.map((wallet) => wallet.slug) },
-      },
-      { $set: { isDeleted: true, updatedAt: new Date() } },
-    ),
-    TransactionCategory.updateMany(
-      {
-        isDefault: true,
-        userId: null,
-        slug: {
-          $nin: DEFAULT_ONBOARDING_CATEGORIES.map((category) => category.slug),
-        },
-      },
-      { $set: { isDeleted: true, updatedAt: new Date() } },
-    ),
-  ]);
-};
+const ACCOUNT_DEACTIVATED_MESSAGE =
+  "Your account is deactivated. Please contact with the admin";
 
 const normalizeOnboardingSelections = (items) => {
   return items.reduce(
@@ -254,26 +75,239 @@ const buildTemplateSelectionQuery = ({ objectIds, slugs }) => {
   };
 };
 
-const formatWalletOption = (wallet) => ({
-  _id: wallet._id,
-  id: wallet.slug,
-  name: wallet.walletName,
-  description: wallet.description || "",
-  icon: wallet.icon || wallet.slug,
-  color: wallet.color,
-  currency: wallet.currency || "USD",
-});
+const parseOpeningAmount = (value, fieldName, { allowNegative = false } = {}) => {
+  if (value === undefined || value === null || value === "") {
+    return { value: 0 };
+  }
 
-const formatCategoryOption = (category) => ({
-  _id: category._id,
-  id: category.slug,
-  name: category.name,
-  description: category.description || "",
-  icon: category.icon || category.slug,
-  color: category.color,
-});
+  const parsed = Number(value);
+  if (Number.isNaN(parsed) || (!allowNegative && parsed < 0)) {
+    return {
+      error: allowNegative
+        ? `${fieldName} must be a valid number`
+        : `${fieldName} must be a non-negative number`,
+    };
+  }
 
-const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
+  return { value: parsed };
+};
+
+const toOrderedWalletEntries = (items) => {
+  const entries = [];
+
+  for (const item of items) {
+    if (typeof item === "string") {
+      entries.push({ kind: "template", value: item });
+      continue;
+    }
+
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    if (item.walletName) {
+      entries.push({ kind: "custom", data: item });
+      continue;
+    }
+
+    const templateRef = item._id || item.id;
+    if (templateRef) {
+      entries.push({ kind: "template", value: templateRef });
+    }
+  }
+
+  return entries;
+};
+
+const toOrderedCategoryEntries = (items) => {
+  const entries = [];
+
+  for (const item of items) {
+    if (typeof item === "string") {
+      entries.push({ kind: "template", value: item });
+      continue;
+    }
+
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const templateRef = item._id || item.id;
+    if (templateRef) {
+      entries.push({ kind: "template", value: templateRef });
+      continue;
+    }
+
+    if (item.name) {
+      entries.push({ kind: "custom", data: item });
+    }
+  }
+
+  return entries;
+};
+
+const buildWalletTemplateMap = (templates) => {
+  const map = new Map();
+
+  for (const template of templates) {
+    map.set(template._id.toString(), template);
+    if (template.slug) {
+      map.set(template.slug.toLowerCase(), template);
+    }
+  }
+
+  return map;
+};
+
+const buildCategoryTemplateMap = (templates) => {
+  const map = new Map();
+
+  for (const template of templates) {
+    map.set(template._id.toString(), template);
+    if (template.slug) {
+      map.set(template.slug.toLowerCase(), template);
+    }
+  }
+
+  return map;
+};
+
+const resolveWalletTemplate = (value, templateMap) => {
+  const key = String(value).trim();
+  if (!key) {
+    return null;
+  }
+
+  if (mongoose.isValidObjectId(key)) {
+    return templateMap.get(key) || null;
+  }
+
+  return templateMap.get(key.toLowerCase()) || null;
+};
+
+const resolveCategoryTemplate = (value, templateMap) => {
+  const key = String(value).trim();
+  if (!key) {
+    return null;
+  }
+
+  if (mongoose.isValidObjectId(key)) {
+    return templateMap.get(key) || null;
+  }
+
+  return templateMap.get(key.toLowerCase()) || null;
+};
+
+const buildCustomWalletSpec = async (data, userId, defaultCurrencyCode) => {
+  const {
+    walletName,
+    color,
+    icon,
+    currency,
+    incomeTotal,
+    expenseTotal,
+    balance,
+  } = data;
+
+  if (!walletName || typeof walletName !== "string" || !walletName.trim()) {
+    return { error: "walletName is required for custom wallets" };
+  }
+
+  let currencyCode = defaultCurrencyCode;
+  if (currency !== undefined && String(currency).trim() !== "") {
+    try {
+      const activeCurrency = await assertActiveCurrency(currency);
+      currencyCode = activeCurrency.code;
+    } catch (error) {
+      return { error: error.message };
+    }
+  }
+
+  const parsedIncomeTotal = parseOpeningAmount(incomeTotal, "incomeTotal");
+  if (parsedIncomeTotal.error) {
+    return { error: parsedIncomeTotal.error };
+  }
+
+  const parsedExpenseTotal = parseOpeningAmount(expenseTotal, "expenseTotal");
+  if (parsedExpenseTotal.error) {
+    return { error: parsedExpenseTotal.error };
+  }
+
+  const parsedBalance = parseOpeningAmount(balance, "balance", {
+    allowNegative: true,
+  });
+  if (parsedBalance.error) {
+    return { error: parsedBalance.error };
+  }
+
+  const openingAmount =
+    balance === undefined || balance === null || balance === ""
+      ? parsedIncomeTotal.value - parsedExpenseTotal.value
+      : parsedBalance.value;
+
+  const doc = {
+    userId,
+    isDefault: false,
+    walletName: walletName.trim(),
+    incomeTotal: 0,
+    expenseTotal: 0,
+    balance: 0,
+    currency: currencyCode,
+  };
+
+  if (color !== undefined) {
+    doc.color = String(color).trim();
+  }
+
+  if (icon !== undefined) {
+    doc.icon = String(icon).trim();
+  }
+
+  return { doc, openingAmount };
+};
+
+const buildCustomCategoryDoc = (data, userId, seenNames) => {
+  const { name, color, icon, type } = data;
+
+  if (!name || typeof name !== "string" || !name.trim()) {
+    return { error: "name is required for custom categories" };
+  }
+
+  const trimmed = name.trim();
+  const normalizedName = trimmed.toLowerCase();
+
+  if (seenNames.has(normalizedName)) {
+    return { error: "Category with this name already exists" };
+  }
+
+  if (type !== undefined && !["INCOME", "EXPENSE"].includes(type)) {
+    return { error: "type must be INCOME or EXPENSE" };
+  }
+
+  seenNames.add(normalizedName);
+
+  const doc = {
+    userId,
+    isDefault: false,
+    name: trimmed,
+    type: type || "EXPENSE",
+  };
+
+  if (color !== undefined) {
+    doc.color = String(color).trim();
+  }
+
+  if (icon !== undefined) {
+    doc.icon = String(icon).trim();
+  }
+
+  return { doc };
+};
+
+const normalizeEmail = (email) =>
+  String(email || "")
+    .trim()
+    .toLowerCase();
 
 const createAuthSession = async ({ user, req }) => {
   user.lastLoginAt = new Date();
@@ -297,8 +331,7 @@ const createAuthSession = async ({ user, req }) => {
     expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
   });
 
-  const responseUser = user.toObject ? user.toObject() : user;
-  delete responseUser.passwordHash;
+  const responseUser = await buildUserProfilePayload(user._id);
 
   return {
     accessToken,
@@ -313,7 +346,9 @@ const getSocialProviderInput = (provider, body) => {
     typeof body.fullName === "string" && body.fullName.trim()
       ? body.fullName.trim()
       : null;
-  const currency = String(body.currency || "AUD").trim().toUpperCase();
+  const currency = String(body.currency || "AUD")
+    .trim()
+    .toUpperCase();
 
   return {
     provider: normalizedProvider,
@@ -339,11 +374,13 @@ const upsertSocialUser = async ({ provider, claims, fullName, currency }) => {
   let user = await User.findOne(providerFilter).select("+passwordHash");
 
   if (!user && email) {
-    user = await User.findOne({ email, isDeleted: false }).select("+passwordHash");
+    user = await User.findOne({ email, isDeleted: false }).select(
+      "+passwordHash",
+    );
   }
 
   if (user && user.status !== "ACTIVE") {
-    const error = new Error("User is not active");
+    const error = new Error(ACCOUNT_DEACTIVATED_MESSAGE);
     error.statusCode = 403;
     throw error;
   }
@@ -356,20 +393,25 @@ const upsertSocialUser = async ({ provider, claims, fullName, currency }) => {
   };
 
   if (user) {
-    const alreadyLinked = (user.authProviders || []).some(
+    const existingProviderEntry = (user.authProviders || []).find(
       (entry) =>
         entry.provider === provider && entry.providerUserId === providerUserId,
     );
 
-    if (!alreadyLinked) {
-      user.authProviders = [...(user.authProviders || []), providerEntry];
-    }
+    user.authProviders = [
+      ...(user.authProviders || []).filter(
+        (entry) => entry.provider !== provider,
+      ),
+      existingProviderEntry || providerEntry,
+    ];
 
     return user;
   }
 
   if (!email) {
-    const error = new Error("Email is required from social provider for first login");
+    const error = new Error(
+      "Email is required from social provider for first login",
+    );
     error.statusCode = 400;
     throw error;
   }
@@ -430,7 +472,7 @@ const signup = async (req, res) => {
   try {
     session.startTransaction();
 
-    const { fullName, email, password, mobileNumber, currency } = req.body;
+    const { fullName, email, password, mobileNumber } = req.body;
 
     /*
     |--------------------------------------------------------------------------
@@ -438,13 +480,8 @@ const signup = async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    if (!fullName || !email || !password || !mobileNumber || !currency) {
+    if (!fullName || !email || !password || !mobileNumber) {
       return errorResponse(res, "All fields are required", 400);
-    }
-
-    const currencyCode = String(currency).trim().toUpperCase();
-    if (currencyCode.length !== 3) {
-      return errorResponse(res, "currency must be a 3-letter code", 400);
     }
 
     /*
@@ -457,13 +494,8 @@ const signup = async (req, res) => {
       return errorResponse(res, "Invalid email", 400);
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | Validate Mobile Number
-    |--------------------------------------------------------------------------
-    */
-
-    if (!validator.isMobilePhone(mobileNumber + "")) {
+    const normalizedMobile = String(mobileNumber).trim();
+    if (!validator.isMobilePhone(normalizedMobile)) {
       return errorResponse(res, "Invalid mobile number", 400);
     }
 
@@ -503,9 +535,8 @@ const signup = async (req, res) => {
         {
           fullName,
           email,
-          mobileNumber,
+          mobileNumber: normalizedMobile,
           passwordHash: hashedPassword,
-          currency: currencyCode,
           authProviders: [
             {
               provider: "PASSWORD",
@@ -556,7 +587,9 @@ const signup = async (req, res) => {
 const verifyOTP = async (req, res) => {
   try {
     const { email, otp } = req.body;
-    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const normalizedEmail = String(email || "")
+      .trim()
+      .toLowerCase();
 
     const existingOTP = await OTP.findOne({
       email: normalizedEmail,
@@ -611,11 +644,14 @@ const login = async (req, res) => {
     const user = await User.findOne({
       email,
       isDeleted: false,
-      status: "ACTIVE",
     }).select("+passwordHash");
 
     if (!user) {
       return errorResponse(res, "Email not registered", 400);
+    }
+
+    if (user.status !== "ACTIVE") {
+      return errorResponse(res, ACCOUNT_DEACTIVATED_MESSAGE, 403);
     }
 
     if (!user.passwordHash) {
@@ -668,18 +704,47 @@ const completeOnboarding = async (req, res) => {
   const session = await mongoose.startSession();
 
   try {
-    await seedOnboardingTemplatesIfMissing();
     session.startTransaction();
 
-    const { selectedWallets = [], selectedCategories = [] } = req.body;
+    const {
+      selectedWallets = [],
+      selectedCategories = [],
+      defaultCurrency,
+    } = req.body;
 
     const userId = req.user.userId;
+
+    const existingUser = await User.findById(userId)
+      .select("onboardingCompleted")
+      .session(session);
+
+    if (!existingUser) {
+      await session.abortTransaction();
+      return errorResponse(res, "User not found", 404);
+    }
+
+    if (existingUser.onboardingCompleted) {
+      await session.abortTransaction();
+      return errorResponse(res, "Onboarding has already been completed", 403);
+    }
 
     /*
     |--------------------------------------------------------------------------
     | Validate Arrays
     |--------------------------------------------------------------------------
     */
+
+    if (!defaultCurrency || !String(defaultCurrency).trim()) {
+      return errorResponse(res, "defaultCurrency is required", 400);
+    }
+
+    let defaultCurrencyCode;
+    try {
+      const activeCurrency = await assertActiveCurrency(defaultCurrency);
+      defaultCurrencyCode = activeCurrency.code;
+    } catch (error) {
+      return errorResponse(res, error.message, error.statusCode || 400);
+    }
 
     if (!Array.isArray(selectedWallets)) {
       return errorResponse(res, "selectedWallets must be array", 400);
@@ -691,26 +756,120 @@ const completeOnboarding = async (req, res) => {
 
     /*
     |--------------------------------------------------------------------------
-    | Fetch Wallet Templates
+    | Resolve Wallet And Category Entries
     |--------------------------------------------------------------------------
     */
 
-    const selectedWalletFilters = normalizeOnboardingSelections(selectedWallets);
+    const walletEntries = toOrderedWalletEntries(selectedWallets);
+    const categoryEntries = toOrderedCategoryEntries(selectedCategories);
+
+    const walletTemplateFilters = normalizeOnboardingSelections(
+      walletEntries
+        .filter((entry) => entry.kind === "template")
+        .map((entry) => entry.value),
+    );
     const walletTemplates = await Wallet.find(
-      buildTemplateSelectionQuery(selectedWalletFilters),
+      buildTemplateSelectionQuery(walletTemplateFilters),
     ).session(session);
+    const walletTemplateMap = buildWalletTemplateMap(walletTemplates);
 
-    /*
-    |--------------------------------------------------------------------------
-    | Fetch Category Templates
-    |--------------------------------------------------------------------------
-    */
-
-    const selectedCategoryFilters =
-      normalizeOnboardingSelections(selectedCategories);
+    const categoryTemplateFilters = normalizeOnboardingSelections(
+      categoryEntries
+        .filter((entry) => entry.kind === "template")
+        .map((entry) => entry.value),
+    );
     const categoryTemplates = await TransactionCategory.find(
-      buildTemplateSelectionQuery(selectedCategoryFilters),
+      buildTemplateSelectionQuery(categoryTemplateFilters),
     ).session(session);
+    const categoryTemplateMap = buildCategoryTemplateMap(categoryTemplates);
+
+    const walletSpecs = [];
+
+    for (const entry of walletEntries) {
+      if (entry.kind === "template") {
+        const template = resolveWalletTemplate(entry.value, walletTemplateMap);
+        if (!template) {
+          await session.abortTransaction();
+          return errorResponse(
+            res,
+            `Wallet template not found: ${entry.value}`,
+            400,
+          );
+        }
+
+        walletSpecs.push({
+          doc: {
+            userId,
+            isDefault: false,
+            walletName: template.walletName,
+            slug: template.slug,
+            description: template.description,
+            icon: template.icon,
+            color: template.color,
+            currency: defaultCurrencyCode,
+            sortOrder: template.sortOrder,
+          },
+        });
+        continue;
+      }
+
+      const customWallet = await buildCustomWalletSpec(
+        entry.data,
+        userId,
+        defaultCurrencyCode,
+      );
+      if (customWallet.error) {
+        await session.abortTransaction();
+        return errorResponse(res, customWallet.error, 400);
+      }
+
+      walletSpecs.push(customWallet);
+    }
+
+    const categoryDocs = [];
+    const seenCategoryNames = new Set();
+
+    for (const entry of categoryEntries) {
+      if (entry.kind === "template") {
+        const template = resolveCategoryTemplate(
+          entry.value,
+          categoryTemplateMap,
+        );
+        if (!template) {
+          await session.abortTransaction();
+          return errorResponse(
+            res,
+            `Category template not found: ${entry.value}`,
+            400,
+          );
+        }
+
+        categoryDocs.push({
+          userId,
+          isDefault: false,
+          name: template.name,
+          slug: template.slug,
+          description: template.description,
+          icon: template.icon,
+          color: template.color,
+          sortOrder: template.sortOrder,
+          type: template.type || "EXPENSE",
+        });
+        continue;
+      }
+
+      const customCategory = buildCustomCategoryDoc(
+        entry.data,
+        userId,
+        seenCategoryNames,
+      );
+      if (customCategory.error) {
+        await session.abortTransaction();
+        return errorResponse(res, customCategory.error, 400);
+      }
+
+      categoryDocs.push(customCategory.doc);
+    }
 
     /*
     |--------------------------------------------------------------------------
@@ -720,31 +879,41 @@ const completeOnboarding = async (req, res) => {
 
     let createdWallets = [];
 
-    if (walletTemplates.length > 0) {
+    if (walletSpecs.length > 0) {
       createdWallets = await Wallet.insertMany(
-        walletTemplates.map((wallet) => ({
-          userId,
-
-          isDefault: false,
-
-          walletName: wallet.walletName,
-
-          slug: wallet.slug,
-
-          description: wallet.description,
-
-          icon: wallet.icon,
-
-          color: wallet.color,
-
-          currency: wallet.currency,
-
-          sortOrder: wallet.sortOrder,
-        })),
-        {
-          session,
-        },
+        walletSpecs.map((spec) => spec.doc),
+        { session },
       );
+
+      for (let index = 0; index < createdWallets.length; index += 1) {
+        const openingAmount = walletSpecs[index].openingAmount || 0;
+        if (openingAmount === 0) {
+          continue;
+        }
+
+        const wallet = createdWallets[index];
+        await WalletTransaction.create(
+          [
+            {
+              userId,
+              walletId: wallet._id,
+              categoryId: null,
+              type: openingAmount > 0 ? "INCOME" : "EXPENSE",
+              amount: Math.abs(openingAmount),
+              title: "Opening balance",
+              description: null,
+              transactionDate: new Date(),
+              categorySnapshot: null,
+              walletSnapshot: {
+                walletName: wallet.walletName,
+                walletColor: wallet.color,
+              },
+              createdBy: userId,
+            },
+          ],
+          { session },
+        );
+      }
     }
 
     /*
@@ -755,29 +924,10 @@ const completeOnboarding = async (req, res) => {
 
     let createdCategories = [];
 
-    if (categoryTemplates.length > 0) {
-      createdCategories = await TransactionCategory.insertMany(
-        categoryTemplates.map((category) => ({
-          userId,
-
-          isDefault: false,
-
-          name: category.name,
-
-          slug: category.slug,
-
-          description: category.description,
-
-          icon: category.icon,
-
-          color: category.color,
-
-          sortOrder: category.sortOrder,
-        })),
-        {
-          session,
-        },
-      );
+    if (categoryDocs.length > 0) {
+      createdCategories = await TransactionCategory.insertMany(categoryDocs, {
+        session,
+      });
     }
 
     /*
@@ -786,7 +936,7 @@ const completeOnboarding = async (req, res) => {
     |--------------------------------------------------------------------------
     */
 
-    const updatedUser = await User.findByIdAndUpdate(
+    await User.findByIdAndUpdate(
       userId,
       {
         selectedWallets: createdWallets.map((wallet) => wallet._id),
@@ -796,10 +946,11 @@ const completeOnboarding = async (req, res) => {
         defaultWalletId:
           createdWallets.length > 0 ? createdWallets[0]._id : null,
 
+        currency: defaultCurrencyCode,
+
         onboardingCompleted: true,
       },
       {
-        new: true,
         session,
       },
     );
@@ -812,17 +963,21 @@ const completeOnboarding = async (req, res) => {
 
     await session.commitTransaction();
 
+    const userPayload = await buildUserProfilePayload(userId);
+
+    if (!userPayload) {
+      return errorResponse(res, "User not found", 404);
+    }
+
     /*
     |--------------------------------------------------------------------------
     | Success Response
     |--------------------------------------------------------------------------
     */
 
-    return successResponse(
-      res,
-      "Onboarding completed successfully",
-      updatedUser,
-    );
+    return successResponse(res, "Onboarding completed successfully", {
+      user: userPayload,
+    });
   } catch (error) {
     await session.abortTransaction();
 
@@ -842,8 +997,6 @@ const completeOnboarding = async (req, res) => {
 
 const getOnboardingOptions = async (req, res) => {
   try {
-    await seedOnboardingTemplatesIfMissing();
-
     /*
     |--------------------------------------------------------------------------
     | Get Default Wallet Templates
@@ -868,7 +1021,7 @@ const getOnboardingOptions = async (req, res) => {
       isDefault: true,
       isDeleted: false,
     })
-      .select("name slug description icon color sortOrder")
+      .select("name slug description icon color sortOrder type")
       .sort({ sortOrder: 1, createdAt: 1 })
       .lean();
 
@@ -880,7 +1033,7 @@ const getOnboardingOptions = async (req, res) => {
 
     return successResponse(res, "Onboarding options fetched successfully", {
       wallets: wallets.map(formatWalletOption),
-      categories: categories.map(formatCategoryOption),
+      categories: groupCategoriesByType(categories),
     });
   } catch (error) {
     return errorResponse(res, error.message);
@@ -896,7 +1049,9 @@ const getOnboardingOptions = async (req, res) => {
 const forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
-    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const normalizedEmail = String(email || "")
+      .trim()
+      .toLowerCase();
 
     /*
     |--------------------------------------------------------------------------
@@ -983,7 +1138,9 @@ const forgotPassword = async (req, res) => {
 const resetPassword = async (req, res) => {
   try {
     const { email, newPassword, confirmNewPassword } = req.body;
-    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const normalizedEmail = String(email || "")
+      .trim()
+      .toLowerCase();
 
     if (!normalizedEmail) {
       return errorResponse(res, "email is required", 400);

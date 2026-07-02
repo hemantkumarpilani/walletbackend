@@ -1,5 +1,5 @@
 const path = require("path");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, PutObjectCommand, DeleteObjectCommand } = require("@aws-sdk/client-s3");
 
 const trimSlashes = (value) => String(value || "").replace(/^\/+|\/+$/g, "");
 
@@ -64,6 +64,23 @@ const uploadBufferToR2 = async ({
   };
 };
 
+const deleteFromR2 = async (storageKey) => {
+  if (!storageKey) {
+    return;
+  }
+
+  try {
+    await getR2Client().send(
+      new DeleteObjectCommand({
+        Bucket: getRequiredEnv("R2_BUCKET_NAME"),
+        Key: storageKey,
+      }),
+    );
+  } catch (error) {
+    console.error(`Failed to delete R2 object ${storageKey}:`, error.message);
+  }
+};
+
 const uploadProfileImage = async ({ buffer, mimeType, originalName, userId }) => {
   const ext = safeExtension(originalName, ".jpg");
   const fileName = `profile-${userId}-${Date.now()}${ext}`;
@@ -89,6 +106,19 @@ const uploadReport = async ({ buffer, mimeType, fileName, userId }) => {
   return uploaded.url;
 };
 
+const uploadSupportImage = async ({ buffer, mimeType, originalName, userId }) => {
+  const ext = safeExtension(originalName, ".jpg");
+  const fileName = `support-${userId}-${Date.now()}${ext}`;
+
+  return uploadBufferToR2({
+    buffer,
+    mimeType,
+    originalName,
+    keyPrefix: `support/${userId}`,
+    fileName,
+  });
+};
+
 const uploadReceipt = async ({ buffer, mimeType, originalName, userId }) => {
   const fallback = mimeType === "application/pdf" ? ".pdf" : ".jpg";
   const ext = safeExtension(originalName, fallback);
@@ -106,5 +136,7 @@ const uploadReceipt = async ({ buffer, mimeType, originalName, userId }) => {
 module.exports = {
   uploadProfileImage,
   uploadReport,
+  uploadSupportImage,
   uploadReceipt,
+  deleteFromR2,
 };
